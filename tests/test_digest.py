@@ -447,6 +447,16 @@ def test_send_digest_message_builds_dry_run_command(monkeypatch: pytest.MonkeyPa
     assert "--dry-run" in captured
 
 
+def test_quick_capture_page_uses_the_existing_capture_endpoint() -> None:
+    response = main.quick_capture_page()
+    body = response.body.decode("utf-8")
+
+    assert response.status_code == 200
+    assert "Workless 快速收集" in body
+    assert 'fetch("/captures"' in body
+    assert "crypto.randomUUID" in body
+
+
 def test_complete_todo_from_text_accepts_confirmation_language(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

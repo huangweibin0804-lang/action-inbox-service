@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -69,7 +69,7 @@ _background_tasks: list[asyncio.Task] = []
 _event_stdin_writers: list[asyncio.StreamWriter] = []
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Action Inbox Sync Service", version="0.2.0")
+app = FastAPI(title="Workless", version="0.3.0")
 
 
 class CaptureIn(BaseModel):
@@ -1221,6 +1221,89 @@ def health() -> dict:
             for task in _background_tasks
         ],
     }
+
+
+@app.get("/quick-capture", response_class=HTMLResponse, include_in_schema=False)
+def quick_capture_page() -> HTMLResponse:
+    """Serve a dependency-free capture page for users without Hammerspoon."""
+    return HTMLResponse(
+        """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workless · 快速收集</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { max-width: 680px; margin: 0 auto; padding: 48px 20px; line-height: 1.5; }
+    h1 { margin-bottom: 8px; } p { color: #666; } label { display: block; font-weight: 600; margin: 24px 0 8px; }
+    textarea, select, button { box-sizing: border-box; font: inherit; width: 100%; }
+    textarea { min-height: 220px; padding: 12px; resize: vertical; }
+    select, button { padding: 12px; } button { margin-top: 20px; cursor: pointer; font-weight: 600; }
+    #status { min-height: 24px; margin-top: 16px; } .error { color: #c62828; } .success { color: #188038; }
+    code { padding: 2px 5px; border-radius: 4px; background: #eee; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Workless 快速收集</h1>
+    <p>粘贴或输入任何待处理信息。提交后，Workless 会按你的本地配置同步、整理并发送提醒。</p>
+    <form id="capture-form">
+      <label for="content">需要处理什么？</label>
+      <textarea id="content" name="content" placeholder="例如：明天下午前确认巴黎贝甜七夕货盘，并回复客户。" required autofocus></textarea>
+      <label for="source">来源</label>
+      <select id="source" name="source">
+        <option>浏览器快速收集</option>
+        <option>手动输入</option>
+        <option>剪贴板</option>
+      </select>
+      <button type="submit">加入 Workless</button>
+      <p id="status" aria-live="polite"></p>
+    </form>
+    <p>仅供运行 Workless 的本机使用。若服务未启动，请先运行 <code>./scripts/run-local.sh</code>。</p>
+  </main>
+  <script>
+    const form = document.getElementById("capture-form");
+    const content = document.getElementById("content");
+    const source = document.getElementById("source");
+    const status = document.getElementById("status");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = content.value.trim();
+      if (!text) return;
+      status.className = "";
+      status.textContent = "正在保存…";
+      try {
+        const response = await fetch("/captures", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: `web-${crypto.randomUUID()}`,
+            content: text,
+            captured_at: new Date().toISOString(),
+            source: source.value,
+            status: "inbox"
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "保存失败，请检查本地服务。");
+        const sync = result.sync || {};
+        status.className = "success";
+        status.textContent = sync.status === "synced"
+          ? "已加入，Workless 正在整理并发送提醒。"
+          : "已保存到本地待同步队列。请检查飞书配置后重试同步。";
+        content.value = "";
+        content.focus();
+      } catch (error) {
+        status.className = "error";
+        status.textContent = error.message || "无法连接本地服务。";
+      }
+    });
+  </script>
+</body>
+</html>"""
+    )
 
 
 @app.post("/captures")
