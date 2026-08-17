@@ -247,7 +247,7 @@ def analyze_records(
     system_prompt = load_system_prompt(current_date=current_date, timezone=timezone)
     resolved_base_url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
     try:
-        max_tokens = int(os.getenv("DEEPSEEK_MAX_TOKENS", "4096"))
+        max_tokens = int(os.getenv("DEEPSEEK_MAX_TOKENS", "2400"))
     except ValueError as exc:
         raise DigestConfigError("DEEPSEEK_MAX_TOKENS 必须是整数。") from exc
 
@@ -493,7 +493,13 @@ def build_digest_card(
     return {
         "config": {"wide_screen_mode": True},
         "header": {
-            "title": {"tag": "plain_text", "content": f"今日总待办 · {len(shown_items)} 项"},
+            "title": {
+                "tag": "plain_text",
+                "content": (
+                    f"今日总待办 · 共 {len(report.items)} 项"
+                    + (f"（优先展示 {len(shown_items)} 项）" if remaining > 0 else "")
+                ),
+            },
             "template": palette,
         },
         "elements": [
@@ -569,7 +575,10 @@ def send_digest_message(
         "--markdown",
         markdown,
         "--idempotency-key",
-        idempotency_key,
+        # Feishu validates this field's length. Callers use descriptive keys
+        # that may include an event UUID, so normalize every key here while
+        # retaining deterministic idempotency.
+        str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key)),
         "--format",
         "json",
     ]

@@ -6,7 +6,7 @@ import pytest
 
 from app import digest
 from app import main
-from app.digest import BaseRecord, DigestConfigError, DigestReport, MockDocumentDraft, TodoItem
+from app.digest import BaseRecord, DigestConfigError, DigestPreview, DigestReport, MockDocumentDraft, TodoItem
 
 
 def test_read_all_base_records_paginates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -152,7 +152,7 @@ def test_build_digest_card_shows_only_top_three_items_and_document_links() -> No
     )
 
     content = card["elements"][0]["text"]["content"]
-    assert card["header"]["title"]["content"] == "今日总待办 · 3 项"
+    assert card["header"]["title"]["content"] == "今日总待办 · 共 4 项（优先展示 3 项）"
     assert "事项1" in content and "事项3" in content
     assert "事项4" not in content
     assert "还有 1 条待办，请在总表查看。" in content
@@ -388,6 +388,43 @@ def test_materialize_reference_documents_links_user_provided_demo_data(
     assert "数据状态：本机演示数据" in first_document
 
 
+def test_standardize_reference_answers_adds_link_and_explicit_missing_fields() -> None:
+    item = TodoItem(
+        title="迪士尼优惠政策",
+        intent="task",
+        priority="P2",
+        due_date=None,
+        category="政策查询",
+        reason="原始记录要求查询",
+        next_action="查询迪士尼乐园当前广告优惠政策",
+        evidence=["最近的广告政策有什么，迪士尼乐园现..."],
+        source_record_ids=["rec1"],
+        todo_id="todo_test",
+        reference_answer="建议查询最新广告政策，并结合现有优惠进行匹配。",
+    )
+    preview = DigestPreview(
+        run_id="run_test",
+        record_count=1,
+        report=DigestReport(summary="", items=[item], risks=[], ignored_count=0),
+        message_markdown="",
+    )
+
+    main.standardize_reference_answers(
+        preview,
+        {
+            "todo_test": {
+                "title": "执行资料：迪士尼优惠政策",
+                "url": "http://127.0.0.1:8787/documents/todo_test",
+            }
+        },
+    )
+
+    answer = preview.report.items[0].reference_answer
+    assert "[执行资料：迪士尼优惠政策](http://127.0.0.1:8787/documents/todo_test)" in answer
+    assert "查询迪士尼乐园当前广告优惠政策" in answer
+    assert "联系人、表单入口和数据明细：待补充。" in answer
+
+
 def test_send_digest_message_builds_dry_run_command(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[str] = []
 
@@ -408,6 +445,90 @@ def test_send_digest_message_builds_dry_run_command(monkeypatch: pytest.MonkeyPa
     assert captured[:3] == ["lark-cli", "im", "+messages-send"]
     assert captured[captured.index("--user-id") + 1] == "ou_xxx"
     assert "--dry-run" in captured
+
+
+def test_complete_todo_from_text_accepts_confirmation_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "list_local_todos",
+        lambda state: [{"todo_id": "todo_1", "title": "巴黎贝甜货盘"}],
+    )
+    monkeypatch.setattr(
+        main,
+        "update_local_todo_state",
+        lambda todo_id, state: {"todo_id": todo_id, "state": state},
+    )
+
+    result = main.complete_todo_from_text("巴黎贝甜货盘我已经确认好了")
+
+    assert result == {"todo_id": "todo_1", "state": "completed"}
+
+
+def test_complete_todos_from_text_matches_a_natural_task_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "list_local_todos",
+        lambda state: [{"todo_id": "todo_1", "title": "泸溪河工单处理"}],
+    )
+    monkeypatch.setattr(
+        main,
+        "update_local_todo_state",
+        lambda todo_id, state: {"todo_id": todo_id, "state": state},
+    )
+
+    result = main.complete_todos_from_text("泸溪河的工单已经全部处理好了")
+
+    assert result == [{"todo_id": "todo_1", "state": "completed"}]
+
+
+def test_complete_todos_from_text_marks_all_active_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "list_local_todos",
+        lambda state: [
+            {"todo_id": "todo_1", "title": "泸溪河工单处理"},
+            {"todo_id": "todo_2", "title": "一证多址认领"},
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "update_local_todo_state",
+        lambda todo_id, state: {"todo_id": todo_id, "state": state},
+    )
+
+    result = main.complete_todos_from_text("所有的待办我都处理好了，全部消除")
+
+    assert [todo["todo_id"] for todo in result] == ["todo_1", "todo_2"]
+
+
+def test_complete_todos_from_text_matches_entities_in_source_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "list_local_todos",
+        lambda state: [{"todo_id": "todo_1", "title": "品牌联名拓展"}],
+    )
+    monkeypatch.setattr(
+        main,
+        "source_texts_for_active_todos",
+        lambda todos: {"todo_1": "联系沪上阿姨、古茗、瑞幸、霸王茶姬推进合作"},
+    )
+    monkeypatch.setattr(
+        main,
+        "update_local_todo_state",
+        lambda todo_id, state: {"todo_id": todo_id, "state": state},
+    )
+
+    result = main.complete_todos_from_text("沪上阿姨、古茗、瑞幸合作意向已经确认好了")
+
+    assert result == [{"todo_id": "todo_1", "state": "completed"}]
 
 
 def test_run_lark_rejects_cli_error(monkeypatch: pytest.MonkeyPatch) -> None:
