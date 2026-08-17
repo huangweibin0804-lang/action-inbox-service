@@ -1,8 +1,12 @@
 import asyncio
 import json
+import logging
 import os
+import re
 import sqlite3
 import subprocess
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -25,6 +29,7 @@ from app.digest import (
     format_task_steps,
     make_preview,
     read_all_base_records,
+    render_digest,
     send_interactive_card,
     send_digest_message,
 )
@@ -55,10 +60,14 @@ MOCK_DOCUMENT_PUBLIC_URL = os.getenv(
     "MOCK_DOCUMENT_PUBLIC_URL", "http://127.0.0.1:8787"
 ).strip().rstrip("/")
 AUTO_DIGEST_ENABLED = os.getenv("AUTO_DIGEST_ENABLED", "true").strip().lower() == "true"
-AUTO_DIGEST_POLL_SECONDS = int(os.getenv("AUTO_DIGEST_POLL_SECONDS", "5"))
-AUTO_DIGEST_DEBOUNCE_SECONDS = int(os.getenv("AUTO_DIGEST_DEBOUNCE_SECONDS", "30"))
+AUTO_DIGEST_POLL_SECONDS = int(os.getenv("AUTO_DIGEST_POLL_SECONDS", "1"))
+# A short quiet window avoids treating one local collection session as several
+# independent batches while keeping the final summary close to real time.
+AUTO_DIGEST_DEBOUNCE_SECONDS = int(os.getenv("AUTO_DIGEST_DEBOUNCE_SECONDS", "10"))
 EVENT_LISTENER_ENABLED = os.getenv("EVENT_LISTENER_ENABLED", "true").strip().lower() == "true"
 _background_tasks: list[asyncio.Task] = []
+_event_stdin_writers: list[asyncio.StreamWriter] = []
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Action Inbox Sync Service", version="0.2.0")
 
@@ -735,6 +744,53 @@ def materialize_mock_documents(
     return documents
 
 
+def standardize_reference_answers(
+    preview: DigestPreview, mock_documents: dict[str, dict[str, str]]
+) -> None:
+    """Give every generated answer a usable, linked operational baseline."""
+    for item in preview.report.items:
+        document = mock_documents.get(item.todo_id or "")
+        if not document:
+            continue
+
+        answer = (item.reference_answer or "").strip()
+        # Scenario-specific material packs already contain concrete guide,
+        # form, or contact hyperlinks and should remain as authored.
+        if "](" in answer:
+            continue
+
+        facts = "；".join(
+            evidence.strip().rstrip("。；")
+            for evidence in item.evidence[:2]
+            if evidence and evidence.strip()
+        ) or "原始记录尚未提供可核验的业务数据"
+        link = f"[{document['title']}]({document['url']})"
+        missing = "联系人、表单入口和数据明细：待补充。"
+        item_text = f"{item.title}{item.next_action}"
+
+        if any(word in item_text for word in ("核实", "确认", "核对", "查询")):
+            item.reference_answer = (
+                f"资料：{link}。当前依据：{facts}。\n"
+                f"请先{item.next_action}，再记录核对结论。{missing}"
+            )
+        elif any(word in item_text for word in ("申请", "认领", "提交", "审核")):
+            item.reference_answer = (
+                f"资料：{link}。当前依据：{facts}。\n"
+                f"请准备并提交：{item.next_action}。{missing}"
+            )
+        elif any(word in item_text for word in ("联系", "联名", "合作", "沟通")):
+            item.reference_answer = (
+                f"联系资料：{link}。当前范围：{facts}。\n"
+                f"联系目的：{item.next_action}。{missing}"
+            )
+        else:
+            detail = answer.rstrip("。") if answer else "处理路径请以执行资料中的原始信息为准"
+            item.reference_answer = (
+                f"资料：{link}。当前依据：{facts}。\n"
+                f"处理动作：{item.next_action}。{detail}。{missing}"
+            )
+
+
 def digest_output_field_names() -> dict[str, str]:
     """Use the concise columns when available, with a safe legacy fallback."""
     command = [
@@ -773,10 +829,7 @@ def sync_digest_to_feishu_table(
     generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     mock_documents = mock_documents or {}
     output_fields = digest_output_field_names()
-    exports: list[dict] = []
-    for item in preview.report.items:
-        if not item.todo_id:
-            continue
+    def upsert_item(item) -> dict:
         fields = {
             "待办简称": item.title,
             "优先级": item.priority,
@@ -824,7 +877,14 @@ def sync_digest_to_feishu_table(
         if not record_id:
             raise DigestError("飞书待办表同步成功，但未返回 record_id。")
         save_todo_export(item.todo_id, str(record_id))
-        exports.append({"todo_id": item.todo_id, "record_id": record_id})
+        return {"todo_id": item.todo_id, "record_id": record_id}
+
+    items = [item for item in preview.report.items if item.todo_id]
+    # Each row has different fields, so the Base batch-update API cannot be
+    # used. A small bounded pool still shortens a five-row summary update while
+    # staying well below normal API concurrency limits.
+    with ThreadPoolExecutor(max_workers=min(3, len(items) or 1)) as executor:
+        exports = list(executor.map(upsert_item, items))
     return {"status": "synced", "count": len(exports), "records": exports}
 
 
@@ -850,28 +910,132 @@ def deliver_digest_automatically(run_id: str) -> dict:
     return result
 
 
-def complete_todo_from_text(text: str) -> dict | None:
+def completion_signals(text: str) -> bool:
+    return any(
+        signal in text
+        for signal in (
+            "已完成",
+            "完成了",
+            "确认好了",
+            "确认完毕",
+            "已确认",
+            "已经确认",
+            "搞定了",
+            "已经搞定",
+            "做完了",
+            "已做完",
+            "处理好了",
+            "处理完毕",
+        )
+    )
+
+
+def todo_matches_text(todo: dict, text: str) -> bool:
+    title = str(todo["title"])
+    if title in text:
+        return True
+    bigrams = {title[index : index + 2] for index in range(max(len(title) - 1, 0))}
+    return len([bigram for bigram in bigrams if bigram and bigram in text]) >= 2
+
+
+def source_texts_for_active_todos(active_todos: list[dict]) -> dict[str, str]:
+    """Return raw source text for each active todo, best-effort only."""
+    try:
+        records = read_all_base_records(
+            base_token=FEISHU_BASE_TOKEN,
+            table_id=FEISHU_TABLE_ID,
+            identity=FEISHU_IDENTITY,
+            field_names=digest_field_names(),
+        )
+    except DigestError:
+        return {}
+    records_by_id = {record.record_id: record for record in records}
+    source_texts: dict[str, str] = {}
+    for todo in active_todos:
+        try:
+            source_ids = json.loads(todo.get("source_record_ids") or "[]")
+        except json.JSONDecodeError:
+            source_ids = []
+        fields = [
+            value
+            for record_id in source_ids
+            if (record := records_by_id.get(record_id))
+            for value in record.fields.values()
+            if isinstance(value, str)
+        ]
+        source_texts[todo["todo_id"]] = "\n".join(fields)
+    return source_texts
+
+
+def source_text_matches_completion(source_text: str, text: str) -> bool:
+    """Match user wording to named entities retained in the source record."""
+    if not source_text:
+        return False
+    bigrams = {
+        source_text[index : index + 2]
+        for index in range(max(len(source_text) - 1, 0))
+        if source_text[index : index + 2].strip()
+    }
+    # Three overlapping bigrams avoids matching generic wording such as “处理好了”.
+    return len([bigram for bigram in bigrams if bigram in text]) >= 3
+
+
+def complete_todos_from_text(text: str) -> list[dict]:
     normalized = text.replace("：", ":").strip()
-    if "完成" not in normalized:
-        return None
-    candidates = [todo for todo in list_local_todos("active") if todo["title"] in normalized]
-    if len(candidates) != 1:
-        return None
-    return update_local_todo_state(candidates[0]["todo_id"], "completed")
+    if not completion_signals(normalized):
+        return []
+    active_todos = list_local_todos("active")
+    all_done = bool(re.search(r"(所有|全部).{0,8}(待办|事项)?.{0,8}(完成|处理好|做完|清除)", normalized))
+    if all_done:
+        candidates = active_todos
+    else:
+        candidates = [todo for todo in active_todos if todo_matches_text(todo, normalized)]
+        if not candidates:
+            source_texts = source_texts_for_active_todos(active_todos)
+            candidates = [
+                todo
+                for todo in active_todos
+                if source_text_matches_completion(source_texts.get(todo["todo_id"], ""), normalized)
+            ]
+    return [update_local_todo_state(todo["todo_id"], "completed") for todo in candidates]
+
+
+def complete_todo_from_text(text: str) -> dict | None:
+    completed = complete_todos_from_text(text)
+    return completed[0] if len(completed) == 1 else None
 
 
 def handle_incoming_message(event: dict) -> None:
     if event.get("sender_id") != FEISHU_RECIPIENT_ID or event.get("message_type") != "text":
+        print(
+            "[action-inbox] ignored message "
+            f"sender={event.get('sender_id')} type={event.get('message_type')}",
+            flush=True,
+        )
         return
-    todo = complete_todo_from_text(str(event.get("content", "")))
-    if not todo:
+    content = str(event.get("content", "")).strip()
+    if content == "#连通性测试":
+        send_digest_message(
+            markdown="监听正常：消息事件、待办解析和机器人回复链路均已连接。",
+            recipient_type=FEISHU_RECIPIENT_TYPE,
+            recipient_id=FEISHU_RECIPIENT_ID,
+            identity=FEISHU_IDENTITY,
+            idempotency_key=f"action-inbox-healthcheck-{event.get('event_id', 'unknown')}",
+        )
+        print("[action-inbox] connection health check replied", flush=True)
         return
+    completed = complete_todos_from_text(content)
+    if not completed:
+        print("[action-inbox] message received but no completion matched", flush=True)
+        return
+    titles = "、".join(todo["title"] for todo in completed)
+    print(f"[action-inbox] completed from message: {titles}", flush=True)
     send_digest_message(
-        markdown=f"已将「{todo['title']}」标记为已完成，30 秒后将发送最新总待办。",
+        markdown=f"已完成：{titles}。正在刷新最新总待办。",
         recipient_type=FEISHU_RECIPIENT_TYPE,
         recipient_id=FEISHU_RECIPIENT_ID,
         identity=FEISHU_IDENTITY,
-        idempotency_key=f"action-inbox-message-complete-{event.get('event_id', todo['todo_id'])}",
+        idempotency_key=f"action-inbox-message-complete-{event.get('event_id', 'unknown')}",
     )
 
 
@@ -892,7 +1056,10 @@ def handle_card_action(event: dict) -> None:
     except HTTPException:
         return
     send_digest_message(
-        markdown=f"已将「{todo['title']}」标记为已完成，30 秒后将发送最新总待办。",
+        markdown=(
+            f"已将「{todo['title']}」标记为已完成，约 {AUTO_DIGEST_DEBOUNCE_SECONDS} 秒后"
+            "将发送最新总待办。"
+        ),
         recipient_type=FEISHU_RECIPIENT_TYPE,
         recipient_id=FEISHU_RECIPIENT_ID,
         identity=FEISHU_IDENTITY,
@@ -910,27 +1077,64 @@ async def consume_feishu_event(event_key: str, handler) -> None:
             event_key,
             "--as",
             "bot",
+            # lark-cli treats stdin EOF as a graceful shutdown. Hold this
+            # writer for the process lifetime so a launchd service keeps its
+            # Feishu event subscription alive after the parent terminal exits.
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         assert process.stdout is not None
+        assert process.stdin is not None
+        assert process.stderr is not None
+        _event_stdin_writers.append(process.stdin)
+
+        async def log_stderr() -> None:
+            while line := await process.stderr.readline():
+                logger.info("Feishu event %s: %s", event_key, line.decode(errors="replace").strip())
+
+        stderr_task = asyncio.create_task(log_stderr())
         try:
             while line := await process.stdout.readline():
+                print(
+                    f"[action-inbox] raw event {event_key}: {line.decode(errors='replace').strip()[:500]}",
+                    flush=True,
+                )
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
+                    print(f"[action-inbox] invalid event JSON for {event_key}", flush=True)
                     continue
-                await asyncio.to_thread(handler, event)
+                logger.info(
+                    "Received Feishu event key=%s id=%s sender=%s type=%s",
+                    event_key,
+                    event.get("event_id"),
+                    event.get("sender_id") or event.get("operator_id"),
+                    event.get("message_type"),
+                )
+                try:
+                    await asyncio.to_thread(handler, event)
+                except Exception:
+                    # A transient reply/API failure must not stop the only
+                    # long-lived consumer for this event stream.
+                    print(
+                        f"[action-inbox] handler failed for {event_key}:\n{traceback.format_exc()}",
+                        flush=True,
+                    )
         finally:
+            _event_stdin_writers.remove(process.stdin)
+            process.stdin.close()
+            await process.stdin.wait_closed()
             if process.returncode is None:
                 process.terminate()
                 await process.wait()
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
         await asyncio.sleep(5)
 
 
 async def auto_digest_monitor() -> None:
-    """Detect source-table changes, debounce 30 seconds, then send one updated card."""
+    """Detect source-table changes, wait for a quiet collection window, then send one card."""
     while True:
         try:
             records = await asyncio.to_thread(
@@ -1012,6 +1216,10 @@ def health() -> dict:
             "mock_document_public_url": MOCK_DOCUMENT_PUBLIC_URL,
             "card_delivery": "interactive_card",
         },
+        "background_tasks": [
+            {"done": task.done(), "cancelled": task.cancelled()}
+            for task in _background_tasks
+        ],
     }
 
 
@@ -1042,6 +1250,8 @@ def create_capture(capture: CaptureIn) -> dict:
 
     sync = run_feishu_sync(capture)
     persist_result(capture, sync)
+    if sync.status == "synced":
+        schedule_auto_digest_refresh()
     return {"duplicate": False, "sync": sync.model_dump()}
 
 
@@ -1092,8 +1302,13 @@ def create_digest_preview() -> dict:
         report = analyze_records(active_records, model=DEEPSEEK_MODEL)
         preview = make_preview(active_records, report)
         reference_documents = materialize_reference_documents(preview)
-        save_digest_preview(preview)
         mock_documents = materialize_mock_documents(preview, active_records)
+        standardize_reference_answers(preview, mock_documents)
+        # Keep the generated local material consistent with the answer written
+        # to the Base and sent in the card.
+        mock_documents = materialize_mock_documents(preview, active_records)
+        preview.message_markdown = render_digest(preview.report)
+        save_digest_preview(preview)
         output_sync = sync_digest_to_feishu_table(preview, mock_documents)
         document_urls = {
             todo_id: document["url"] for todo_id, document in mock_documents.items()

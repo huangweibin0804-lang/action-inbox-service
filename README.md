@@ -69,14 +69,14 @@ FEISHU_RECIPIENT_ID=ou_xxx
 DEEPSEEK_API_KEY=你的DeepSeek密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
-DEEPSEEK_MAX_TOKENS=4096
+DEEPSEEK_MAX_TOKENS=2400
 DIGEST_PROMPT_FILE=prompts/todo_digest_system.md
 
 MOCK_DOCUMENT_DIR=data/mock_documents
 MOCK_DOCUMENT_PUBLIC_URL=http://127.0.0.1:8787
 AUTO_DIGEST_ENABLED=true
-AUTO_DIGEST_POLL_SECONDS=5
-AUTO_DIGEST_DEBOUNCE_SECONDS=30
+AUTO_DIGEST_POLL_SECONDS=1
+AUTO_DIGEST_DEBOUNCE_SECONDS=10
 EVENT_LISTENER_ENABLED=true
 ```
 
@@ -134,9 +134,9 @@ curl -X POST http://127.0.0.1:8787/digest/preview
 
 ## 自动刷新与完成待办
 
-服务每 5 秒读取一次原始待办表；检测到变化后等待 30 秒，重新分析并自动发送 1 张最新汇总卡。连续修改会重置 30 秒倒计时，避免连发卡片。
+通过本机捕获接口新增待办后，服务会立即开始防抖；直接在原始待办表编辑时，服务每秒检测一次。检测到变化后等待连续 10 秒无新增或修改，再一次性读取全量记录、覆盖更新今日总待办，并发送 1 张最新汇总卡。连续修改会重置 10 秒倒计时，避免把同一轮收集拆成多张卡片。
 
-汇总卡片中每条待办都有“完成：事项”按钮。点击后会把完成状态保存到本机 SQLite，并在 30 秒后发送最新汇总卡。也可在与机器人的私聊中发送“完成 巴黎贝甜货盘”这类文本命令。
+汇总卡片中每条待办都有“完成：事项”按钮。点击后会把完成状态保存到本机 SQLite，并在约 10 秒后发送最新汇总卡。机器人也能理解“巴黎贝甜货盘我已经确认好了”“所有的待办我都处理好了，全部消除”等自然表达；识别后会先即时确认，再异步刷新卡片。
 
 在飞书开放平台的“事件与回调”中启用 `im.message.receive_v1` 和 `card.action.trigger`，并确保应用拥有 `im:message.p2p_msg:readonly` 与 `im:message:readonly` 权限；否则服务可以运行，但无法收到私聊回复或卡片点击。
 
